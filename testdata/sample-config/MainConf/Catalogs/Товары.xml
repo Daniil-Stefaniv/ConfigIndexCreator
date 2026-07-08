@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject>
+  <Catalog uuid="00000000-0000-0000-0000-000000000003">
+    <Properties>
+      <Name>Товары</Name>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="00000000-0000-0000-0000-000000000004">
+        <Properties>
+          <Name>Родитель</Name>
+          <Type>cfg:CatalogRef.Товары</Type>
+        </Properties>
+      </Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>

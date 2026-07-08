@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject>
+  <Configuration uuid="00000000-0000-0000-0000-000000000001">
+    <Properties>
+      <Name>DemoConfiguration</Name>
+      <Synonym>
+        <item>
+          <lang>ru</lang>
+          <content>Демо конфигурация</content>
+        </item>
+      </Synonym>
+    </Properties>
+  </Configuration>
+</MetaDataObject>

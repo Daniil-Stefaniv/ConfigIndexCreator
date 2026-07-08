@@ -1,0 +1,17 @@
+{
+  "name": "config-index-creator",
+  "version": "0.1.0",
+  "description": "Universal static indexer and merge helper for 1C XML configuration dumps.",
+  "type": "module",
+  "bin": {
+    "config-indexer": "./bin/config-indexer.mjs"
+  },
+  "scripts": {
+    "check": ".\\tools\\node\\win-x64\\node.exe --check ./bin/config-indexer.mjs && .\\tools\\node\\win-x64\\node.exe --check ./src/cli.mjs && .\\tools\\node\\win-x64\\node.exe --check ./src/indexer.mjs && .\\tools\\node\\win-x64\\node.exe --check ./src/parser.mjs && .\\tools\\node\\win-x64\\node.exe --check ./src/merge.mjs && .\\tools\\node\\win-x64\\node.exe --check ./src/utils.mjs",
+    "smoke": ".\\config-indexer.cmd primary --config ./testdata/sample-config --pretty"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}
