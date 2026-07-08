@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import readline from "node:readline";
 import { collectSourceRoots, resolveProjectPaths } from "./config.mjs";
 import { buildCallResolver, parseFile } from "./parser.mjs";
 import {
@@ -29,9 +30,19 @@ export async function runIndex(mode, options = {}) {
     throw new Error(`Configuration sources were not found in ${paths.configurationRoot}`);
   }
 
-  const previousManifest = mode === "update" ? readJsonIfExists(path.join(cacheRoot, "file-manifest.json"), null) : null;
+  const cacheManifestFile = path.join(cacheRoot, "file-manifest.json");
+  const partialManifestFile = path.join(cacheRoot, "file-manifest.partial.json");
+  const finalCacheManifest = readJsonIfExists(cacheManifestFile, null);
+  const partialCacheManifest = readJsonIfExists(partialManifestFile, null);
+  const previousManifest =
+    mode === "update"
+      ? finalCacheManifest || partialCacheManifest
+      : options.resumeCache
+        ? finalCacheManifest || partialCacheManifest
+        : null;
   const previousFiles = new Map((previousManifest?.files || []).map((entry) => [entry.path, entry]));
-  const useCache = mode === "update" && !options.force;
+  const useCache = (mode === "update" || options.resumeCache) && !options.force;
+  const allowUnverifiedCache = Boolean(options.resumeCache && !previousManifest);
 
   const records = {
     objects: [],
@@ -48,6 +59,7 @@ export async function runIndex(mode, options = {}) {
     parsedFiles: 0,
     cacheHits: 0,
     cacheMisses: 0,
+    recoveredCacheHits: 0,
     skippedFiles: 0,
   };
 
@@ -56,107 +68,278 @@ export async function runIndex(mode, options = {}) {
     includeExtensions,
     excludeRoots: [paths.indexRoot],
   });
+  const checkpointEvery = positiveNumber(options.checkpointEvery) || positiveNumber(options.progressEvery) || 5000;
+  const spill = createRecordSpill(paths);
 
-  for (const file of files) {
-    stats.scannedFiles += 1;
-    const state = {
-      ...fileState(file, paths.configurationRoot),
-      parserVersion: PARSER_VERSION,
-      cachePath: cachePathFor(file, paths.configurationRoot),
-    };
-    const cacheFile = path.join(fileCacheRoot, state.cachePath);
-    const previous = previousFiles.get(state.path);
-    let parsed = null;
+  try {
+    for (const file of files) {
+      stats.scannedFiles += 1;
+      const state = {
+        ...fileState(file, paths.configurationRoot),
+        parserVersion: PARSER_VERSION,
+        cachePath: cachePathFor(file, paths.configurationRoot),
+      };
+      const cacheFile = path.join(fileCacheRoot, state.cachePath);
+      const previous = previousFiles.get(state.path);
+      let parsed = null;
 
-    if (useCache && previous && sameFileState(state, previous) && fs.existsSync(cacheFile)) {
-      parsed = readJsonIfExists(cacheFile, null);
-      if (parsed) {
-        stats.cacheHits += 1;
+      if (useCache && previous && sameFileState(state, previous) && fs.existsSync(cacheFile)) {
+        parsed = readJsonIfExists(cacheFile, null);
+        if (parsed) {
+          stats.cacheHits += 1;
+        }
+      } else if (allowUnverifiedCache && fs.existsSync(cacheFile)) {
+        parsed = readJsonIfExists(cacheFile, null);
+        if (parsed && parsed.file === state.path) {
+          stats.cacheHits += 1;
+          stats.recoveredCacheHits += 1;
+        } else {
+          parsed = null;
+        }
+      }
+
+      if (!parsed) {
+        try {
+          parsed = parseFile(file, {
+            workspaceRoot: paths.workspaceRoot,
+            configurationRoot: paths.configurationRoot,
+            indexRoot: paths.indexRoot,
+            sources,
+          });
+        } catch (error) {
+          parsed = {
+            file: relativePath(paths.configurationRoot, file),
+            kind: path.extname(file).slice(1).toLowerCase(),
+            objects: [],
+            forms: [],
+            commands: [],
+            modules: [],
+            procedures: [],
+            references: [],
+            errors: [{ reason: `${error.name}: ${error.message}` }],
+          };
+        }
+        writeJsonAtomic(cacheFile, parsed, false);
+        stats.parsedFiles += 1;
+        stats.cacheMisses += 1;
+      }
+
+      await appendParsed(records, parsed, spill);
+      fileManifest.push(state);
+
+      if (checkpointEvery && stats.scannedFiles % checkpointEvery === 0) {
+        writeCacheManifest(partialManifestFile, paths, fileManifest, stats, false);
+      }
+
+      if (stats.scannedFiles % Number(options.progressEvery || 5000) === 0) {
+        console.log(
+          `Indexed files: ${stats.scannedFiles} (parsed ${stats.parsedFiles}, cache ${stats.cacheHits})`,
+        );
       }
     }
 
-    if (!parsed) {
-      try {
-        parsed = parseFile(file, {
-          workspaceRoot: paths.workspaceRoot,
-          configurationRoot: paths.configurationRoot,
-          indexRoot: paths.indexRoot,
-          sources,
-        });
-      } catch (error) {
-        parsed = {
-          file: relativePath(paths.configurationRoot, file),
-          kind: path.extname(file).slice(1).toLowerCase(),
-          objects: [],
-          forms: [],
-          commands: [],
-          modules: [],
-          procedures: [],
-          references: [],
-          errors: [{ reason: `${error.name}: ${error.message}` }],
-        };
-      }
-      writeJsonAtomic(cacheFile, parsed, false);
-      stats.parsedFiles += 1;
-      stats.cacheMisses += 1;
-    }
+    writeCacheManifest(partialManifestFile, paths, fileManifest, stats, false);
+    await spill.close();
 
-    appendParsed(records, parsed);
-    fileManifest.push(state);
+    attachRecords(records);
+    const outputFiles = await writeIndexes(records, paths, sources, mode, options, spill);
+    const counts = countRecords(records, outputFiles);
 
-    if (stats.scannedFiles % Number(options.progressEvery || 5000) === 0) {
-      console.log(
-        `Indexed files: ${stats.scannedFiles} (parsed ${stats.parsedFiles}, cache ${stats.cacheHits})`,
-      );
-    }
-  }
-
-  attachRecords(records);
-  const outputFiles = await writeIndexes(records, paths, sources, mode, options);
-  const counts = countRecords(records, outputFiles.callEdges);
-
-  const manifest = {
-    schema: SCHEMA,
-    parserVersion: PARSER_VERSION,
-    generatedAt: utcNow(),
-    mode,
-    workspaceRoot: paths.workspaceRoot,
-    configurationRoot: paths.configurationRoot,
-    indexRoot: paths.indexRoot,
-    sources,
-    counts,
-    stats,
-    files: outputFiles.files,
-    cache: {
-      manifest: path.join(cacheRoot, "file-manifest.json"),
-      files: fileCacheRoot,
-    },
-  };
-
-  writeJsonAtomic(path.join(paths.indexRoot, "index_Manifest.json"), manifest, Boolean(options.pretty));
-  writeJsonAtomic(
-    path.join(cacheRoot, "file-manifest.json"),
-    {
+    const manifest = {
       schema: SCHEMA,
       parserVersion: PARSER_VERSION,
-      generatedAt: manifest.generatedAt,
+      generatedAt: utcNow(),
+      mode,
+      workspaceRoot: paths.workspaceRoot,
       configurationRoot: paths.configurationRoot,
-      files: fileManifest,
-    },
-    false,
-  );
+      indexRoot: paths.indexRoot,
+      sources,
+      counts,
+      stats,
+      files: outputFiles.files,
+      cache: {
+        manifest: cacheManifestFile,
+        partialManifest: partialManifestFile,
+        files: fileCacheRoot,
+      },
+    };
 
-  return { paths, manifest };
+    writeJsonAtomic(path.join(paths.indexRoot, "index_Manifest.json"), manifest, Boolean(options.pretty));
+    writeCacheManifest(cacheManifestFile, paths, fileManifest, stats, true, manifest.generatedAt);
+
+    return { paths, manifest };
+  } finally {
+    await spill.close();
+    spill.cleanup();
+  }
 }
 
-function appendParsed(records, parsed) {
+async function appendParsed(records, parsed, spill) {
   records.objects.push(...(parsed.objects || []));
   records.forms.push(...(parsed.forms || []));
   records.commands.push(...(parsed.commands || []));
   records.modules.push(...(parsed.modules || []));
-  records.procedures.push(...(parsed.procedures || []));
+  for (const procedure of parsed.procedures || []) {
+    await spill.addProcedure(procedure);
+    records.procedures.push(compactProcedure(procedure));
+  }
   records.references.push(...(parsed.references || []));
   records.errors.push(...(parsed.errors || []).map((error) => ({ file: parsed.file, ...error })));
+}
+
+function compactProcedure(procedure) {
+  const { calls, metadataReferences, ...compact } = procedure;
+  return {
+    ...compact,
+    callsCount: calls?.length || 0,
+    metadataReferencesCount: metadataReferences?.length || 0,
+  };
+}
+
+function positiveNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function writeCacheManifest(file, paths, files, stats, complete, generatedAt = utcNow()) {
+  writeJsonAtomic(
+    file,
+    {
+      schema: SCHEMA,
+      parserVersion: PARSER_VERSION,
+      generatedAt,
+      complete: Boolean(complete),
+      configurationRoot: paths.configurationRoot,
+      files,
+      stats,
+    },
+    false,
+  );
+}
+
+function createRecordSpill(paths) {
+  const root = path.join(paths.indexRoot, ".cache", "spill", `${process.pid}-${Date.now()}`);
+  ensureDir(root);
+  const callsFile = path.join(root, "procedure-calls.ndjson");
+  const procedureRefsFile = path.join(root, "procedure-references.ndjson");
+  const callWriter = createJsonLineWriter(callsFile);
+  const procedureRefWriter = createJsonLineWriter(procedureRefsFile);
+
+  let closed = false;
+  const spill = {
+    root,
+    callsFile,
+    procedureRefsFile,
+    callRecords: 0,
+    callItems: 0,
+    procedureReferenceRecords: 0,
+    procedureReferenceItems: 0,
+    async addProcedure(procedure) {
+      const calls = procedure.calls || [];
+      if (calls.length) {
+        await callWriter.write({ procedureId: procedure.id, calls });
+        spill.callRecords += 1;
+        spill.callItems += calls.length;
+      }
+
+      const metadataReferences = procedure.metadataReferences || [];
+      if (metadataReferences.length) {
+        await procedureRefWriter.write({ procedureId: procedure.id, metadataReferences });
+        spill.procedureReferenceRecords += 1;
+        spill.procedureReferenceItems += metadataReferences.length;
+      }
+    },
+    async close() {
+      if (closed) {
+        return;
+      }
+      await Promise.all([callWriter.close(), procedureRefWriter.close()]);
+      closed = true;
+    },
+    cleanup() {
+      if (!closed) {
+        return;
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+  return spill;
+}
+
+function createJsonLineWriter(file) {
+  ensureDir(path.dirname(file));
+  const stream = fs.createWriteStream(file, { encoding: "utf8" });
+  let closed = false;
+  let streamError = null;
+  stream.on("error", (error) => {
+    streamError = error;
+  });
+
+  return {
+    async write(value) {
+      if (closed) {
+        throw new Error(`Cannot write to closed spill file: ${file}`);
+      }
+      if (streamError) {
+        throw streamError;
+      }
+      const line = `${JSON.stringify(value)}\n`;
+      if (!stream.write(line)) {
+        await waitForStreamEvent(stream, "drain");
+      }
+      if (streamError) {
+        throw streamError;
+      }
+    },
+    async close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (streamError) {
+        throw streamError;
+      }
+      stream.end();
+      await waitForStreamEvent(stream, "finish");
+      if (streamError) {
+        throw streamError;
+      }
+    },
+  };
+}
+
+function waitForStreamEvent(stream, eventName) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      stream.off(eventName, onEvent);
+      stream.off("error", onError);
+    };
+    const onEvent = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    stream.once(eventName, onEvent);
+    stream.once("error", onError);
+  });
+}
+
+async function* readJsonLines(file) {
+  if (!fs.existsSync(file)) {
+    return;
+  }
+  const input = fs.createReadStream(file, { encoding: "utf8" });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  for await (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed) {
+      yield JSON.parse(trimmed);
+    }
+  }
 }
 
 function cachePathFor(file, configurationRoot) {
@@ -197,7 +380,6 @@ function attachRecords(records) {
     }
   }
 
-  const moduleById = new Map(records.modules.map((module) => [module.id, module]));
   const procCountsByModule = new Map();
   for (const proc of records.procedures) {
     procCountsByModule.set(proc.moduleId, (procCountsByModule.get(proc.moduleId) || 0) + 1);
@@ -211,7 +393,7 @@ function attachRecords(records) {
         startLine: proc.startLine,
         endLine: proc.endLine,
         export: proc.export,
-        callsCount: proc.calls?.length || 0,
+        callsCount: proc.callsCount ?? proc.calls?.length ?? 0,
       });
     }
   }
@@ -235,7 +417,7 @@ function objectKey(source, type, name) {
   return `${source || ""}|${type || ""}|${name || ""}`;
 }
 
-async function writeIndexes(records, paths, sources, mode, options) {
+async function writeIndexes(records, paths, sources, mode, options, spill) {
   const pretty = Boolean(options.pretty);
   const files = {};
   const write = (name, data) => {
@@ -288,25 +470,32 @@ async function writeIndexes(records, paths, sources, mode, options) {
       pretty,
       mapItem: (proc) => ({
         ...proc,
-        callsCount: proc.calls?.length || 0,
-        metadataReferencesCount: proc.metadataReferences?.length || 0,
+        callsCount: proc.callsCount ?? proc.calls?.length ?? 0,
+        metadataReferencesCount: proc.metadataReferencesCount ?? proc.metadataReferences?.length ?? 0,
         calls: undefined,
+        metadataReferences: undefined,
       }),
     },
   );
   files["index_Procedures.json"] = path.join(paths.indexRoot, "index_Procedures.json");
 
-  const references = buildReferences(records);
-  await writeJsonArrayFile(
+  const procedureById = new Map(records.procedures.map((procedure) => [procedure.id, procedure]));
+  const references = await writeReferences(
     path.join(paths.indexRoot, "index_References.json"),
-    { schema: SCHEMA, generatedAt: utcNow() },
-    "references",
-    references,
-    { pretty },
+    records,
+    spill,
+    pretty,
+    procedureById,
   );
   files["index_References.json"] = path.join(paths.indexRoot, "index_References.json");
 
-  const callEdges = await writeCallGraph(path.join(paths.indexRoot, "index_CallGraph.json"), records, pretty);
+  const callEdges = await writeCallGraph(
+    path.join(paths.indexRoot, "index_CallGraph.json"),
+    records,
+    spill,
+    pretty,
+    procedureById,
+  );
   files["index_CallGraph.json"] = path.join(paths.indexRoot, "index_CallGraph.json");
 
   const extensionTransitions = buildExtensionTransitions(records);
@@ -324,72 +513,82 @@ async function writeIndexes(records, paths, sources, mode, options) {
     });
   }
 
-  return { files, callEdges, mode, sources };
+  return { files, callEdges, references, mode, sources };
 }
 
-function buildReferences(records) {
-  const refs = [];
-  for (const object of records.objects) {
-    for (const ref of object.references || []) {
-      refs.push({
-        kind: ref.kind || "object_reference",
-        fromSource: object.source,
-        fromObjectType: object.objectType,
-        fromObjectName: object.name,
-        fromFullName: object.fullName,
-        fromPath: object.path,
-        ...ref,
-      });
+async function writeReferences(file, records, spill, pretty, procedureById) {
+  async function* references() {
+    for (const object of records.objects) {
+      for (const ref of object.references || []) {
+        yield {
+          kind: ref.kind || "object_reference",
+          fromSource: object.source,
+          fromObjectType: object.objectType,
+          fromObjectName: object.name,
+          fromFullName: object.fullName,
+          fromPath: object.path,
+          ...ref,
+        };
+      }
+    }
+    for (const form of records.forms) {
+      for (const ref of form.metadataReferences || []) {
+        yield {
+          kind: ref.kind || "form_reference",
+          fromSource: form.source,
+          fromFormId: form.id,
+          fromOwnerType: form.ownerType,
+          fromOwnerName: form.ownerName,
+          fromPath: form.path,
+          ...ref,
+        };
+      }
+    }
+    for (const command of records.commands) {
+      for (const ref of command.typeReferences || []) {
+        yield {
+          kind: "command_type",
+          fromSource: command.source,
+          fromCommandId: command.id,
+          fromOwnerType: command.ownerType,
+          fromOwnerName: command.ownerName,
+          fromPath: command.path,
+          ...ref,
+        };
+      }
+    }
+    for await (const entry of readJsonLines(spill.procedureRefsFile)) {
+      const proc = procedureById.get(entry.procedureId);
+      if (!proc) {
+        continue;
+      }
+      for (const ref of entry.metadataReferences || []) {
+        yield {
+          kind: ref.kind || "bsl_reference",
+          fromSource: proc.source,
+          fromProcedureId: proc.id,
+          fromModuleId: proc.moduleId,
+          fromOwnerType: proc.ownerType,
+          fromOwnerName: proc.ownerName,
+          fromPath: proc.path,
+          ...ref,
+        };
+      }
     }
   }
-  for (const form of records.forms) {
-    for (const ref of form.metadataReferences || []) {
-      refs.push({
-        kind: ref.kind || "form_reference",
-        fromSource: form.source,
-        fromFormId: form.id,
-        fromOwnerType: form.ownerType,
-        fromOwnerName: form.ownerName,
-        fromPath: form.path,
-        ...ref,
-      });
-    }
-  }
-  for (const command of records.commands) {
-    for (const ref of command.typeReferences || []) {
-      refs.push({
-        kind: "command_type",
-        fromSource: command.source,
-        fromCommandId: command.id,
-        fromOwnerType: command.ownerType,
-        fromOwnerName: command.ownerName,
-        fromPath: command.path,
-        ...ref,
-      });
-    }
-  }
-  for (const proc of records.procedures) {
-    for (const ref of proc.metadataReferences || []) {
-      refs.push({
-        kind: ref.kind || "bsl_reference",
-        fromSource: proc.source,
-        fromProcedureId: proc.id,
-        fromModuleId: proc.moduleId,
-        fromOwnerType: proc.ownerType,
-        fromOwnerName: proc.ownerName,
-        fromPath: proc.path,
-        ...ref,
-      });
-    }
-  }
-  return refs;
+
+  return writeJsonArrayFile(file, { schema: SCHEMA, generatedAt: utcNow() }, "references", references(), { pretty });
 }
 
-async function writeCallGraph(file, records, pretty) {
+async function writeCallGraph(file, records, spill, pretty, procedureById) {
   const resolver = buildCallResolver(records.modules, records.procedures);
-  function* edges() {
-    for (const proc of records.procedures) {
-      for (const call of proc.calls || []) {
+  async function* edges() {
+    for await (const entry of readJsonLines(spill.callsFile)) {
+      const proc = procedureById.get(entry.procedureId);
+      if (!proc) {
+        continue;
+      }
+      for (const call of entry.calls || []) {
         const targets = resolver.resolve(call, proc);
         yield {
           fromProcedureId: proc.id,
@@ -451,7 +650,7 @@ function buildExtensionTransitions(records) {
   return transitions;
 }
 
-function countRecords(records, callEdgesCount) {
+function countRecords(records, outputFiles) {
   const objectTypeCounts = {};
   for (const object of records.objects) {
     objectTypeCounts[object.objectType] = (objectTypeCounts[object.objectType] || 0) + 1;
@@ -463,8 +662,8 @@ function countRecords(records, callEdgesCount) {
     commands: records.commands.length,
     modules: records.modules.length,
     procedures: records.procedures.length,
-    callEdges: callEdgesCount,
-    references: buildReferences(records).length,
+    callEdges: outputFiles.callEdges,
+    references: outputFiles.references,
     errors: records.errors.length,
   };
 }

@@ -69,6 +69,7 @@ export async function runMerge(options) {
       pretty: options.pretty,
       force: false,
       progressEvery: options.progressEvery,
+      checkpointEvery: options.checkpointEvery,
     });
     stats.index = indexResult.manifest.counts;
   }

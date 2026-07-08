@@ -82,7 +82,7 @@ export async function writeJsonArrayFile(file, scalarFields, arrayName, items, o
   }
   await write(`${JSON.stringify(arrayName)}:[`);
   let firstItem = true;
-  for (const item of items) {
+  for await (const item of items) {
     if (!firstItem) {
       await write(",");
     }

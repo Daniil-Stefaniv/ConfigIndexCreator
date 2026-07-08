@@ -9,5 +9,6 @@ if (-not (Test-Path -LiteralPath $Node -PathType Leaf)) {
     exit 9009
 }
 
-& $Node $Cli @args
+$MaxOldSpaceSize = if ($env:CONFIG_INDEXER_MAX_OLD_SPACE_SIZE) { $env:CONFIG_INDEXER_MAX_OLD_SPACE_SIZE } else { "8192" }
+& $Node "--max-old-space-size=$MaxOldSpaceSize" $Cli @args
 exit $LASTEXITCODE

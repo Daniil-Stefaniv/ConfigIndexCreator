@@ -27,11 +27,14 @@ Options:
   --no-content-compare        During merge, copy same-size timestamp-different files without hashing.
   --pretty                    Pretty JSON output. Easier to read, larger and slower.
   --force                     In update mode, ignore cache and parse all files.
+  --resume-cache              In primary mode, reuse existing per-file cache after an interrupted run.
   --progress-every <number>   Progress log interval by scanned files. Default: 5000.
+  --checkpoint-every <number> Write partial cache manifest interval. Default: progress interval.
   --help                      Show this help.
 
 Runtime:
   The Windows launcher uses local Node.js from tools/node/win-x64/node.exe.
+  The launcher defaults to --max-old-space-size=8192; override with CONFIG_INDEXER_MAX_OLD_SPACE_SIZE.
 `;
 
 export async function main(argv) {
@@ -69,7 +72,7 @@ function parseArgs(argv) {
       continue;
     }
     const key = toCamel(arg.slice(2));
-    if (["pretty", "force", "deleteMissing", "dryRun"].includes(key)) {
+    if (["pretty", "force", "deleteMissing", "dryRun", "resumeCache"].includes(key)) {
       options[key] = true;
       continue;
     }
@@ -82,7 +85,7 @@ function parseArgs(argv) {
       throw new Error(`Missing value for ${arg}`);
     }
     i += 1;
-    if (key === "progressEvery") {
+    if (key === "progressEvery" || key === "checkpointEvery") {
       options[key] = Number(value);
     } else {
       options[key] = value;
